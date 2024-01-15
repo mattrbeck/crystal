@@ -69,7 +69,7 @@ module Crystal
         vars[macro_block_arg.name] = call_block || Nop.new
       end
 
-      new(program, scope, path_lookup, a_macro.location, vars, call.block, a_def, in_macro)
+      new(program, scope, path_lookup, a_macro.location, vars, call.block, a_def, in_macro, call)
     end
 
     record MacroVarKey, name : String, exps : Array(ASTNode)?
@@ -77,7 +77,7 @@ module Crystal
     def initialize(@program : Program,
                    @scope : Type, @path_lookup : Type, @location : Location?,
                    @vars = {} of String => ASTNode, @block : Block? = nil, @def : Def? = nil,
-                   @in_macro = false)
+                   @in_macro = false, @call : Call? = nil)
       @str = IO::Memory.new(512) # Can't be String::Builder because of `{{debug}}`
       @last = Nop.new
     end
@@ -238,7 +238,7 @@ module Crystal
       visit_macro_for_array_like node, exp, exp.elements, &.itself
     end
 
-    def visit_macro_for_array_like(node, exp, entries)
+    def visit_macro_for_array_like(node, exp, entries, &)
       element_var = node.vars[0]
       index_var = node.vars[1]?
 
@@ -254,7 +254,7 @@ module Crystal
       @vars.delete index_var.name if index_var
     end
 
-    def visit_macro_for_hash_like(node, exp, entries)
+    def visit_macro_for_hash_like(node, exp, entries, &)
       key_var = node.vars[0]
       value_var = node.vars[1]?
       index_var = node.vars[2]?
@@ -358,9 +358,13 @@ module Crystal
         args = node.args.map { |arg| accept arg }
         named_args = node.named_args.try &.to_h { |arg| {arg.name, accept arg.value} }
 
+        # normalize needed for param unpacking
+        block = node.block.try { |b| @program.normalize(b) }
+
         begin
-          @last = receiver.interpret(node.name, args, named_args, node.block, self, node.name_location)
+          @last = receiver.interpret(node.name, args, named_args, block, self, node.name_location)
         rescue ex : MacroRaiseException
+          # Re-raise to avoid the logic in the other rescue blocks and to retain the original location
           raise ex
         rescue ex : Crystal::CodeError
           node.raise ex.message, inner: ex
@@ -369,6 +373,7 @@ module Crystal
         end
       else
         # no receiver: special calls
+        # may raise `Crystal::TopLevelMacroRaiseException`
         interpret_top_level_call node
       end
 
@@ -413,7 +418,7 @@ module Crystal
     end
 
     def resolve?(node : Path)
-      if node.names.size == 1 && (match = @free_vars.try &.[node.names.first]?)
+      if (single_name = node.single_name?) && (match = @free_vars.try &.[single_name]?)
         matched_type = match
       else
         matched_type = @path_lookup.lookup_path(node)
@@ -506,12 +511,14 @@ module Crystal
     end
 
     def visit(node : Splat)
+      warnings.add_warning(node, "Deprecated use of splat operator. Use `#splat` instead")
       node.exp.accept self
       @last = @last.interpret("splat", [] of ASTNode, nil, nil, self, node.location)
       false
     end
 
     def visit(node : DoubleSplat)
+      warnings.add_warning(node, "Deprecated use of double splat operator. Use `#double_splat` instead")
       node.exp.accept self
       @last = @last.interpret("double_splat", [] of ASTNode, nil, nil, self, node.location)
       false
@@ -533,6 +540,12 @@ module Crystal
         @last = TypeNode.new(@program)
       when "@def"
         @last = @def || NilLiteral.new
+      when "@caller"
+        @last = if call = @call
+                  ArrayLiteral.map [call], &.itself
+                else
+                  NilLiteral.new
+                end
       else
         node.raise "unknown macro instance var: '#{node.name}'"
       end

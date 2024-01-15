@@ -1,6 +1,5 @@
 require "crystal/system/thread_linked_list"
 require "./fiber/context"
-require "./fiber/stack_pool"
 
 # :nodoc:
 @[NoInline]
@@ -47,13 +46,10 @@ class Fiber
   # :nodoc:
   protected class_getter(fibers) { Thread::LinkedList(Fiber).new }
 
-  # :nodoc:
-  class_getter stack_pool = StackPool.new
-
   @context : Context
   @stack : Void*
-  @resume_event : Crystal::Event?
-  @timeout_event : Crystal::Event?
+  @resume_event : Crystal::EventLoop::Event?
+  @timeout_event : Crystal::EventLoop::Event?
   # :nodoc:
   property timeout_select_action : Channel::TimeoutAction?
   protected property stack_bottom : Void*
@@ -62,7 +58,7 @@ class Fiber
   property name : String?
 
   @alive = true
-  @current_thread = Atomic(Thread?).new(nil)
+  {% if flag?(:preview_mt) %} @current_thread = Atomic(Thread?).new(nil) {% end %}
 
   # :nodoc:
   property next : Fiber?
@@ -76,7 +72,7 @@ class Fiber
   end
 
   # :nodoc:
-  def self.unsafe_each
+  def self.unsafe_each(&)
     fibers.unsafe_each { |fiber| yield fiber }
   end
 
@@ -89,10 +85,9 @@ class Fiber
     @context = Context.new
     @stack, @stack_bottom =
       {% if flag?(:interpreted) %}
-        # For interpreted mode we don't need a new stack, the stack is held by the interpreter
         {Pointer(Void).null, Pointer(Void).null}
       {% else %}
-        Fiber.stack_pool.checkout
+        Crystal::Scheduler.stack_pool.checkout
       {% end %}
 
     fiber_main = ->(f : Fiber) { f.run }
@@ -136,7 +131,7 @@ class Fiber
       {% end %}
     thread.gc_thread_handler, @stack_bottom = GC.current_thread_stack_bottom
     @name = "main"
-    @current_thread.set(thread)
+    {% if flag?(:preview_mt) %} @current_thread.set(thread) {% end %}
     Fiber.fibers.push(self)
   end
 
@@ -153,16 +148,8 @@ class Fiber
     ex.inspect_with_backtrace(STDERR)
     STDERR.flush
   ensure
-    {% if flag?(:preview_mt) %}
-      Crystal::Scheduler.enqueue_free_stack @stack
-    {% elsif flag?(:interpreted) %}
-      # For interpreted mode we don't need a new stack, the stack is held by the interpreter
-    {% else %}
-      Fiber.stack_pool.release(@stack)
-    {% end %}
-
     # Remove the current fiber from the linked list
-    Fiber.fibers.delete(self)
+    Fiber.inactive(self)
 
     # Delete the resume event if it was used by `yield` or `sleep`
     @resume_event.try &.free
@@ -170,6 +157,9 @@ class Fiber
     @timeout_select_action = nil
 
     @alive = false
+    {% unless flag?(:interpreted) %}
+      Crystal::Scheduler.stack_pool.release(@stack)
+    {% end %}
     Crystal::Scheduler.reschedule
   end
 
@@ -193,7 +183,7 @@ class Fiber
   # The fiber's proc has terminated, and the fiber is now considered dead. The
   # fiber is impossible to resume, ever.
   def dead? : Bool
-    @alive == false
+    !@alive
   end
 
   # Immediately resumes execution of this fiber.
@@ -224,13 +214,13 @@ class Fiber
   end
 
   # :nodoc:
-  def resume_event : Crystal::Event
-    @resume_event ||= Crystal::EventLoop.create_resume_event(self)
+  def resume_event : Crystal::EventLoop::Event
+    @resume_event ||= Crystal::Scheduler.event_loop.create_resume_event(self)
   end
 
   # :nodoc:
-  def timeout_event : Crystal::Event
-    @timeout_event ||= Crystal::EventLoop.create_timeout_event(self)
+  def timeout_event : Crystal::EventLoop::Event
+    @timeout_event ||= Crystal::Scheduler.event_loop.create_timeout_event(self)
   end
 
   # :nodoc:
@@ -305,4 +295,16 @@ class Fiber
     # Push the used section of the stack
     GC.push_stack @context.stack_top, @stack_bottom
   end
+
+  {% if flag?(:preview_mt) %}
+    # :nodoc:
+    def set_current_thread(thread = Thread.current) : Thread
+      @current_thread.set(thread)
+    end
+
+    # :nodoc:
+    def get_current_thread : Thread?
+      @current_thread.lazy_get
+    end
+  {% end %}
 end

@@ -353,6 +353,24 @@ describe "Semantic: doc" do
     a.locations.not_nil!.size.should eq(1)
   end
 
+  it "stores location for implicit flag enum members" do
+    result = semantic %(
+      @[Flags]
+      enum Foo
+        A = 1
+        B = 2
+      end
+    ), wants_doc: true
+    program = result.program
+    foo = program.types["Foo"]
+
+    a_loc = foo.types["All"].locations.should_not be_nil
+    a_loc.should_not be_empty
+
+    b_loc = foo.types["None"].locations.should_not be_nil
+    b_loc.should_not be_empty
+  end
+
   it "stores doc for constant" do
     result = semantic %(
       # Hello
@@ -419,7 +437,7 @@ describe "Semantic: doc" do
   end
 
   it "stores doc for macro defined in macro call" do
-    result = semantic <<-CR, wants_doc: true
+    result = semantic <<-CRYSTAL, wants_doc: true
       macro def_foo
         macro foo
         end
@@ -427,7 +445,7 @@ describe "Semantic: doc" do
 
       # Hello
       def_foo
-      CR
+      CRYSTAL
     program = result.program
     foo = program.macros.not_nil!["foo"].first
     foo.doc.should eq("Hello")

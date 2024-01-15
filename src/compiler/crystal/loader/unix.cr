@@ -35,15 +35,37 @@ class Crystal::Loader
     end
   end
 
+  def initialize(@search_paths : Array(String))
+  end
+
   # Parses linker arguments in the style of `ld`.
-  def self.parse(args : Array(String), *, search_paths : Array(String) = default_search_paths) : self
+  #
+  # *dll_search_paths* has no effect. (Technically speaking, `LD_LIBRARY_PATH`
+  # goes here and `LIBRARY_PATH` goes into *search_paths*, but there is little
+  # point in doing so since the same library files are used at both compile and
+  # run time.)
+  def self.parse(args : Array(String), *, search_paths : Array(String) = default_search_paths, dll_search_paths : Array(String)? = nil) : self
     libnames = [] of String
     file_paths = [] of String
+
+    # `man ld(1)` on Linux:
+    #
+    # > -L searchdir
+    # > ... The directories are searched in the order in which they are
+    # specified on the command line. Directories specified on the command line
+    # are searched before the default directories.
+    #
+    # `man ld(1)` on macOS:
+    #
+    # > -Ldir
+    # > ... Directories specified with -L are searched in the order they appear
+    # > on the command line and before the default search path...
+    extra_search_paths = [] of String
 
     # OptionParser removes items from the args array, so we dup it here in order to produce a meaningful error message.
     OptionParser.parse(args.dup) do |parser|
       parser.on("-L DIRECTORY", "--library-path DIRECTORY", "Add DIRECTORY to library search path") do |directory|
-        search_paths << directory
+        extra_search_paths << directory
       end
       parser.on("-l LIBNAME", "--library LIBNAME", "Search for library LIBNAME") do |libname|
         libnames << libname
@@ -56,8 +78,12 @@ class Crystal::Loader
       end
     end
 
+    search_paths = extra_search_paths + search_paths
+
     begin
-      self.new(search_paths, libnames, file_paths)
+      loader = new(search_paths)
+      loader.load_all(libnames, file_paths)
+      loader
     rescue exc : LoadError
       exc.args = args
       exc.search_paths = search_paths
@@ -104,6 +130,7 @@ class Crystal::Loader
   def load_current_program_handle
     if program_handle = LibC.dlopen(nil, LibC::RTLD_LAZY | LibC::RTLD_GLOBAL)
       @handles << program_handle
+      @loaded_libraries << (Process.executable_path || "current program handle")
     end
   end
 
@@ -121,18 +148,28 @@ class Crystal::Loader
   def self.default_search_paths : Array(String)
     default_search_paths = [] of String
 
+    # TODO: respect the compiler's DT_RPATH (#13490)
+
     if env_library_path = ENV[{{ flag?(:darwin) ? "DYLD_LIBRARY_PATH" : "LD_LIBRARY_PATH" }}]?
       # TODO: Expand tokens $ORIGIN, $LIB, $PLATFORM
       default_search_paths.concat env_library_path.split(Process::PATH_DELIMITER, remove_empty: true)
     end
 
-    {% if flag?(:linux) || flag?(:bsd) %}
+    # TODO: respect the compiler's DT_RUNPATH
+    # TODO: respect $DYLD_FALLBACK_LIBRARY_PATH and the compiler's LC_RPATH on darwin
+
+    {% if (flag?(:linux) && !flag?(:android)) || flag?(:bsd) %}
       read_ld_conf(default_search_paths)
     {% end %}
 
     {% if flag?(:darwin) %}
       default_search_paths << "/usr/lib"
       default_search_paths << "/usr/local/lib"
+    {% elsif flag?(:android) %}
+      default_search_paths << "/vendor/lib64" if File.directory?("/vendor/lib64")
+      default_search_paths << "/system/lib64" if File.directory?("/system/lib64")
+      default_search_paths << "/vendor/lib"
+      default_search_paths << "/system/lib"
     {% else %}
       {% if flag?(:linux) %}
         default_search_paths << "/lib64" if File.directory?("/lib64")

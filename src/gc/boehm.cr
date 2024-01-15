@@ -15,17 +15,30 @@
 #
 # OTHERS: On other systems, we add the linker annotation here to make sure libpthread is loaded
 # before libgc which looks up symbols from libpthread.
-{% unless flag?(:win32) || flag?(:musl) || flag?(:darwin) || (flag?(:interpreted) && flag?(:gnu)) %}
+{% unless flag?(:win32) || flag?(:musl) || flag?(:darwin) || flag?(:android) || (flag?(:interpreted) && flag?(:gnu)) %}
   @[Link("pthread")]
 {% end %}
 
 {% if flag?(:freebsd) || flag?(:dragonfly) %}
   @[Link("gc-threaded")]
-{% else %}
+{% elsif flag?(:interpreted) %}
+  # FIXME: We're not using the pkg-config name here because that would resolve the
+  # lib flags for libgc including `-lpthread` which the interpreter is not able
+  # to load on systems with modern libc where libpthread is only available as an
+  # (empty) static library.
   @[Link("gc")]
+{% else %}
+  @[Link("gc", pkg_config: "bdw-gc")]
 {% end %}
 
+{% if compare_versions(Crystal::VERSION, "1.11.0-dev") >= 0 %}
+  @[Link(dll: "gc.dll")]
+{% end %}
 lib LibGC
+  {% unless flag?(:win32) %}
+    VERSION = {{ `pkg-config bdw-gc --silence-errors --modversion || printf "0.0.0"`.chomp.stringify }}
+  {% end %}
+
   alias Int = LibC::Int
   alias SizeT = LibC::SizeT
   {% if flag?(:win32) && flag?(:bits64) %}
@@ -54,6 +67,8 @@ lib LibGC
     markers_m1 : Word
     bytes_reclaimed_since_gc : Word
     reclaimed_bytes_before_gc : Word
+    expl_freed_bytes_since_gc : Word
+    obtained_from_os_bytes : Word
   end
 
   fun init = GC_init
@@ -91,7 +106,7 @@ lib LibGC
 
   fun push_all_eager = GC_push_all_eager(bottom : Void*, top : Void*)
 
-  {% if flag?(:preview_mt) || flag?(:win32) %}
+  {% if flag?(:preview_mt) || flag?(:win32) || compare_versions(VERSION, "8.2.0") >= 0 %}
     fun get_my_stackbottom = GC_get_my_stackbottom(sb : StackBase*) : ThreadHandle
     fun set_stackbottom = GC_set_stackbottom(th : ThreadHandle, sb : StackBase*) : ThreadHandle
   {% else %}
@@ -107,8 +122,11 @@ lib LibGC
 
   fun size = GC_size(addr : Void*) : LibC::SizeT
 
-  {% unless flag?(:win32) || flag?(:wasm32) %}
-    # Boehm GC requires to use GC_pthread_create and GC_pthread_join instead of pthread_create and pthread_join
+  # Boehm GC requires to use its own thread manipulation routines instead of pthread's or Win32's
+  {% if flag?(:win32) %}
+    fun beginthreadex = GC_beginthreadex(security : Void*, stack_size : LibC::UInt, start_address : Void* -> LibC::UInt,
+                                         arglist : Void*, initflag : LibC::UInt, thrdaddr : LibC::UInt*) : Void*
+  {% elsif !flag?(:wasm32) %}
     fun pthread_create = GC_pthread_create(thread : LibC::PthreadT*, attr : LibC::PthreadAttrT*, start : Void* -> Void*, arg : Void*) : LibC::Int
     fun pthread_join = GC_pthread_join(thread : LibC::PthreadT, value : Void**) : LibC::Int
     fun pthread_detach = GC_pthread_detach(thread : LibC::PthreadT) : LibC::Int
@@ -155,7 +173,7 @@ module GC
       # This implements `String#starts_with?` without allocating a `String` (#11728)
       format_string = Slice.new(msg, Math.min(LibC.strlen(msg), start.bytesize))
       unless format_string == start.to_slice
-        LibC.printf msg, v
+        Crystal::System.print_error msg, v
       end
     end
   end
@@ -217,11 +235,11 @@ module GC
     Stats.new(
       # collections: collections,
       # bytes_found: bytes_found,
-      heap_size: heap_size,
-      free_bytes: free_bytes,
-      unmapped_bytes: unmapped_bytes,
-      bytes_since_gc: bytes_since_gc,
-      total_bytes: total_bytes
+      heap_size: heap_size.to_u64!,
+      free_bytes: free_bytes.to_u64!,
+      unmapped_bytes: unmapped_bytes.to_u64!,
+      bytes_since_gc: bytes_since_gc.to_u64!,
+      total_bytes: total_bytes.to_u64!
     )
   end
 
@@ -229,29 +247,36 @@ module GC
     LibGC.get_prof_stats(out stats, sizeof(LibGC::ProfStats))
 
     ProfStats.new(
-      heap_size: stats.heap_size,
-      free_bytes: stats.free_bytes,
-      unmapped_bytes: stats.unmapped_bytes,
-      bytes_since_gc: stats.bytes_since_gc,
-      bytes_before_gc: stats.bytes_before_gc,
-      non_gc_bytes: stats.non_gc_bytes,
-      gc_no: stats.gc_no,
-      markers_m1: stats.markers_m1,
-      bytes_reclaimed_since_gc: stats.bytes_reclaimed_since_gc,
-      reclaimed_bytes_before_gc: stats.reclaimed_bytes_before_gc)
+      heap_size: stats.heap_size.to_u64!,
+      free_bytes: stats.free_bytes.to_u64!,
+      unmapped_bytes: stats.unmapped_bytes.to_u64!,
+      bytes_since_gc: stats.bytes_since_gc.to_u64!,
+      bytes_before_gc: stats.bytes_before_gc.to_u64!,
+      non_gc_bytes: stats.non_gc_bytes.to_u64!,
+      gc_no: stats.gc_no.to_u64!,
+      markers_m1: stats.markers_m1.to_u64!,
+      bytes_reclaimed_since_gc: stats.bytes_reclaimed_since_gc.to_u64!,
+      reclaimed_bytes_before_gc: stats.reclaimed_bytes_before_gc.to_u64!,
+      expl_freed_bytes_since_gc: stats.expl_freed_bytes_since_gc.to_u64!,
+      obtained_from_os_bytes: stats.obtained_from_os_bytes.to_u64!)
   end
 
-  {% unless flag?(:win32) %}
+  {% if flag?(:win32) %}
+    # :nodoc:
+    def self.beginthreadex(security : Void*, stack_size : LibC::UInt, start_address : Void* -> LibC::UInt, arglist : Void*, initflag : LibC::UInt, thrdaddr : LibC::UInt*) : LibC::HANDLE
+      ret = LibGC.beginthreadex(security, stack_size, start_address, arglist, initflag, thrdaddr)
+      raise RuntimeError.from_errno("GC_beginthreadex") if ret.null?
+      ret.as(LibC::HANDLE)
+    end
+  {% else %}
     # :nodoc:
     def self.pthread_create(thread : LibC::PthreadT*, attr : LibC::PthreadAttrT*, start : Void* -> Void*, arg : Void*)
       LibGC.pthread_create(thread, attr, start, arg)
     end
 
     # :nodoc:
-    def self.pthread_join(thread : LibC::PthreadT) : Void*
-      ret = LibGC.pthread_join(thread, out value)
-      raise RuntimeError.from_os_error("pthread_join", Errno.new(ret)) unless ret == 0
-      value
+    def self.pthread_join(thread : LibC::PthreadT)
+      LibGC.pthread_join(thread, nil)
     end
 
     # :nodoc:
@@ -262,10 +287,11 @@ module GC
 
   # :nodoc:
   def self.current_thread_stack_bottom
-    {% if flag?(:preview_mt) || flag?(:win32) %}
+    {% if LibGC.has_method?(:get_my_stackbottom) %}
       th = LibGC.get_my_stackbottom(out sb)
       {th, sb.mem_base}
     {% else %}
+      # support for legacy gc releases
       {Pointer(Void).null, LibGC.stackbottom}
     {% end %}
   end
@@ -277,10 +303,11 @@ module GC
       sb.mem_base = stack_bottom
       LibGC.set_stackbottom(thread_handle, pointerof(sb))
     end
-  {% elsif flag?(:win32) %}
+  {% elsif LibGC.has_method?(:set_stackbottom) %}
     # this is necessary because Boehm GC does _not_ use `GC_stackbottom` on
-    # Windows when pushing all threads' stacks; instead `GC_set_stackbottom`
-    # must be used to associate the new bottom with the running thread
+    # Windows when pushing all threads' stacks; it also started crashing on
+    # Linux with libgc after v8.2.4; instead `GC_set_stackbottom` must be used
+    # to associate the new bottom with the running thread
     def self.set_stackbottom(stack_bottom : Void*)
       sb = LibGC::StackBase.new
       sb.mem_base = stack_bottom
@@ -288,6 +315,7 @@ module GC
       LibGC.set_stackbottom(nil, pointerof(sb))
     end
   {% else %}
+    # support for legacy gc releases
     def self.set_stackbottom(stack_bottom : Void*)
       LibGC.stackbottom = stack_bottom
     end

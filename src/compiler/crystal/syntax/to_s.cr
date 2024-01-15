@@ -28,7 +28,6 @@ module Crystal
     def initialize(@str = IO::Memory.new, @macro_expansion_pragmas = nil, @emit_doc = false)
       @indent = 0
       @inside_macro = 0
-      @inside_lib = false
     end
 
     def visit_any(node)
@@ -73,9 +72,7 @@ module Crystal
         # If there's no '.' nor 'e', for example in `1_f64`,
         # we need to include it (#3315)
         node.value.each_char do |char|
-          if char == '.' || char == 'e'
-            return false
-          end
+          return false if char.in?('.', 'e')
         end
 
         true
@@ -112,7 +109,7 @@ module Crystal
       false
     end
 
-    def visit_interpolation(node)
+    def visit_interpolation(node, &)
       node.expressions.each do |exp|
         if exp.is_a?(StringLiteral)
           @str << yield exp.value
@@ -347,7 +344,7 @@ module Crystal
         node_obj = nil
       end
 
-      if node_obj && (node.name == "[]" || node.name == "[]?") && !block
+      if node_obj && node.name.in?("[]", "[]?") && !block
         in_parenthesis(need_parens, node_obj)
 
         @str << "["
@@ -478,7 +475,7 @@ module Crystal
       end
     end
 
-    def in_parenthesis(need_parens)
+    def in_parenthesis(need_parens, &)
       if need_parens
         @str << '('
         yield
@@ -513,7 +510,13 @@ module Crystal
       when StringInterpolation
         visit_interpolation exp, &.inspect_unquoted.gsub('`', "\\`")
       else
-        raise "Bug: shouldn't happen"
+        # This branch can be reached after the literal expander has expanded
+        # `StringLiteral` nodes to a call to `::String.interpolation` which means
+        # `exp` is a `Call`.
+
+        @str << "\#{"
+        exp.accept(self)
+        @str << "}"
       end
       @str << '`'
       false
@@ -616,7 +619,7 @@ module Crystal
         @str << '.'
       end
       @str << node.name
-      if node.args.size > 0 || node.block_arg || node.double_splat
+      if node.args.size > 0 || node.block_arity || node.double_splat
         @str << '('
         printed_arg = false
         node.args.each_with_index do |arg, i|
@@ -635,7 +638,9 @@ module Crystal
           @current_arg_type = :block_arg
           @str << ", " if printed_arg
           block_arg.accept self
-          printed_arg = true
+        elsif node.block_arity
+          @str << ", " if printed_arg
+          @str << '&'
         end
         @str << ')'
       end
@@ -841,25 +846,6 @@ module Crystal
     def visit(node : Generic)
       name = node.name
 
-      if @inside_lib && (name.is_a?(Path) && name.names.size == 1)
-        case name.names.first
-        when "Pointer"
-          node.type_vars.first.accept self
-          @str << '*'
-          return false
-        when "StaticArray"
-          if node.type_vars.size == 2
-            node.type_vars[0].accept self
-            @str << '['
-            node.type_vars[1].accept self
-            @str << ']'
-            return false
-          end
-        else
-          # Not a special type
-        end
-      end
-
       node.name.accept self
 
       printed_arg = false
@@ -885,11 +871,7 @@ module Crystal
     end
 
     def visit_named_arg_name(name)
-      if Symbol.needs_quotes_for_named_argument?(name)
-        name.inspect(@str)
-      else
-        @str << name
-      end
+      Symbol.quote_for_named_argument(@str, name)
     end
 
     def visit(node : Underscore)
@@ -994,9 +976,9 @@ module Crystal
         end
         @str << '/'
       end
-      @str << 'i' if node.options.includes? Regex::Options::IGNORE_CASE
-      @str << 'm' if node.options.includes? Regex::Options::MULTILINE
-      @str << 'x' if node.options.includes? Regex::Options::EXTENDED
+      @str << 'i' if node.options.ignore_case?
+      @str << 'm' if node.options.multiline?
+      @str << 'x' if node.options.extended?
       false
     end
 
@@ -1038,7 +1020,15 @@ module Crystal
         node.args.each_with_index do |arg, i|
           @str << ", " if i > 0
           @str << '*' if i == node.splat_index
-          arg.accept self
+
+          if arg.name == ""
+            # This is an unpack
+            unpack = node.unpacks.not_nil![i]
+
+            visit_unpack(unpack)
+          else
+            arg.accept self
+          end
         end
         @str << '|'
       end
@@ -1050,6 +1040,19 @@ module Crystal
       @str << "end"
 
       false
+    end
+
+    def visit_unpack(node)
+      case node
+      when Expressions
+        @str << "("
+        node.expressions.join(@str, ", ") do |exp|
+          visit_unpack exp
+        end
+        @str << ")"
+      else
+        node.accept self
+      end
     end
 
     def visit(node : Include)
@@ -1106,11 +1109,9 @@ module Crystal
 
     def visit(node : LibDef)
       @str << "lib "
-      @str << node.name
+      node.name.accept self
       newline
-      @inside_lib = true
       accept_with_indent(node.body)
-      @inside_lib = false
       append_indent
       @str << "end"
       false
@@ -1123,11 +1124,7 @@ module Crystal
       else
         @str << node.name
         @str << " = "
-        if Symbol.needs_quotes_for_named_argument?(node.real_name)
-          node.real_name.inspect(@str)
-        else
-          @str << node.real_name
-        end
+        Symbol.quote_for_named_argument(@str, node.real_name)
       end
       if node.args.size > 0
         @str << '('
@@ -1151,7 +1148,6 @@ module Crystal
       if body = node.body
         newline
         accept_with_indent body
-        newline
         append_indent
         @str << "end"
       end
@@ -1233,6 +1229,20 @@ module Crystal
 
     def visit(node : InstanceSizeOf)
       @str << "instance_sizeof("
+      node.exp.accept(self)
+      @str << ')'
+      false
+    end
+
+    def visit(node : AlignOf)
+      @str << "alignof("
+      node.exp.accept(self)
+      @str << ')'
+      false
+    end
+
+    def visit(node : InstanceAlignOf)
+      @str << "instance_alignof("
       node.exp.accept(self)
       @str << ')'
       false
@@ -1511,7 +1521,7 @@ module Crystal
       end
     end
 
-    def with_indent
+    def with_indent(&)
       @indent += 1
       yield
       @indent -= 1
@@ -1536,13 +1546,13 @@ module Crystal
       newline
     end
 
-    def inside_macro
+    def inside_macro(&)
       @inside_macro += 1
       yield
       @inside_macro -= 1
     end
 
-    def outside_macro
+    def outside_macro(&)
       old_inside_macro = @inside_macro
       @inside_macro = 0
       yield

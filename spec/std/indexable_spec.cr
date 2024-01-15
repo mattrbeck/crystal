@@ -1,4 +1,5 @@
 require "spec"
+require "spec/helpers/iterate"
 
 private class SafeIndexable
   include Indexable(Int32)
@@ -130,6 +131,28 @@ describe Indexable do
       indexable = SafeIndexable.new(3)
       indexable.rindex(1, 2_i64).should eq 1
       indexable.rindex(1, 2_i64).should be_a(Int64)
+    end
+  end
+
+  describe "#rindex!" do
+    it "does rindex with big negative offset" do
+      indexable = SafeIndexable.new(3)
+      expect_raises Enumerable::NotFoundError do
+        indexable.rindex!(0, -100)
+      end
+    end
+
+    it "does rindex with big offset" do
+      indexable = SafeIndexable.new(3)
+      expect_raises Enumerable::NotFoundError do
+        indexable.rindex!(0, 100)
+      end
+    end
+
+    it "offset type" do
+      indexable = SafeIndexable.new(3)
+      indexable.rindex!(1, 2_i64).should eq 1
+      indexable.rindex!(1, 2_i64).should be_a(Int64)
     end
   end
 
@@ -788,6 +811,11 @@ describe Indexable do
         b.should eq(comb)
       end
       iter.next.should be_a(Iterator::Stop)
+    end
+
+    describe "n > size (#14088)" do
+      it_iterates "#each_repeated_combination", [[1, 1, 1], [1, 1, 2], [1, 2, 2], [2, 2, 2]], SafeIndexable.new(2, 1).each_repeated_combination(3)
+      it_iterates "#each_repeated_combination", [[1, 1, 1, 1], [1, 1, 1, 2], [1, 1, 2, 2], [1, 2, 2, 2], [2, 2, 2, 2]], SafeIndexable.new(2, 1).each_repeated_combination(4)
     end
   end
 end
