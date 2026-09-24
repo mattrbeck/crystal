@@ -53,6 +53,26 @@ describe "Code gen: cast" do
       CRYSTAL
   end
 
+  it "raises TypeCastError for a type whose ID is assigned after the first cast" do
+    run(<<-CRYSTAL).to_b.should be_true
+      require "prelude"
+
+      a = 1 || 'a'
+      begin
+        a.as(Char)
+      rescue
+      end
+
+      b = Int32.class || 'a'
+      begin
+        b.as(Char)
+        false
+      rescue ex
+        ex.message.not_nil!.includes?("Cast from Class to Char failed") && (ex.class == TypeCastError)
+      end
+      CRYSTAL
+  end
+
   it "casts from union to another union" do
     run(<<-CRYSTAL).to_i.should eq(1)
       require "prelude"

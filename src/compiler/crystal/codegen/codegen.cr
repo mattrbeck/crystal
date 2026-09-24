@@ -540,6 +540,8 @@ module Crystal
         codegen_fun node.real_name, node.external, @program, is_exported_fun: true
       end
 
+      define_type_id_to_class_name_fun
+
       env_dump = ENV["DUMP"]?
       case env_dump
       when Nil
@@ -1617,28 +1619,37 @@ module Crystal
       end
     end
 
-    def type_id_to_class_name(type_id)
-      map_name = "__crystal_type_id_to_class_name_map"
+    private TYPE_ID_TO_CLASS_NAME_FUN_NAME = "~type_id_to_class_name"
 
-      global = @main_mod.globals[map_name]?
-      unless global
-        global = @main_mod.globals.add(@main_llvm_typer.llvm_type(@program.string).array(@program.llvm_id.@ids.size), map_name)
-        global.linkage = LLVM::Linkage::Internal if @single_module
+    def type_id_to_class_name(type_id)
+      func = typed_fun?(@main_mod, TYPE_ID_TO_CLASS_NAME_FUN_NAME) ||
+             add_typed_fun(@main_mod, TYPE_ID_TO_CLASS_NAME_FUN_NAME, LLVM::Type.function([@main_llvm_context.int32], @main_llvm_typer.llvm_type(@program.string)))
+      func = check_main_fun TYPE_ID_TO_CLASS_NAME_FUN_NAME, func
+      call func, [type_id] of LLVM::Value
+    end
+
+    # Type IDs keep being assigned until the end of codegen, so the type name
+    # table is only built here, after every call site of
+    # `type_id_to_class_name` has been generated.
+    private def define_type_id_to_class_name_fun
+      return unless func = typed_fun?(@main_mod, TYPE_ID_TO_CLASS_NAME_FUN_NAME)
+
+      in_main do
+        context.fun = func.func
+        context.fun_type = func.type
+        context.fun.linkage = LLVM::Linkage::Internal if @single_module
+        position_at_end func.func.basic_blocks.append("entry")
+        set_internal_fun_debug_location(func.func, TYPE_ID_TO_CLASS_NAME_FUN_NAME)
+
+        map_type = llvm_type(@program.string).array(@program.llvm_id.@ids.size)
+        global = @main_mod.globals.add(map_type, "__crystal_type_id_to_class_name_map")
+        global.linkage = LLVM::Linkage::Internal
         global.initializer = create_type_id_to_class_name_map
         global.global_constant = true
-      end
 
-      if @llvm_mod != @main_mod
-        global = @llvm_mod.globals[map_name]?
-        unless global
-          global = @llvm_mod.globals.add(@llvm_typer.llvm_type(@program.string).array(@program.llvm_id.@ids.size), map_name)
-          global.linkage = LLVM::Linkage::External
-          global.global_constant = true
-        end
+        str_ptr = gep map_type, global, 0, func.func.params.first
+        ret load(llvm_type(@program.string), str_ptr)
       end
-
-      str_ptr = gep llvm_type(@program.string).array(@program.llvm_id.@ids.size), global, 0, type_id
-      load llvm_type(@program.string), str_ptr
     end
 
     def create_type_id_to_class_name_map
