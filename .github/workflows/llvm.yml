@@ -65,7 +65,16 @@ jobs:
             http://apt.llvm.org/${{ matrix.codename }}/ \
             llvm-toolchain-${{ matrix.codename }}${{ matrix.llvm_version && format('-{0}', matrix.llvm_version) || '' }} \
             main
-          sudo apt install -y llvm${{ matrix.llvm_version && format('-{0}', matrix.llvm_version) || '' }}-dev lld
+          if [ -n "${{ matrix.llvm_version }}" ]; then
+            sudo apt install -y llvm-${{ matrix.llvm_version }}-dev lld
+          else
+            # The unversioned `llvm-dev` and `lld` packages of the nightly
+            # repository can lag behind and depend on packages that are no
+            # longer available, so we install the latest versioned ones instead
+            llvm_version=$(apt-cache search --names-only '^llvm-[0-9]+-dev$' | sed -nE 's/^llvm-([0-9]+)-dev .*/\1/p' | sort -n | tail -n1)
+            sudo apt install -y "llvm-$llvm_version-dev" "lld-$llvm_version"
+            sudo ln -s "/usr/bin/ld.lld-$llvm_version" /usr/local/bin/ld.lld
+          fi
 
       - name: Install Crystal
         uses: crystal-lang/install-crystal@v1
